@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "androidmigrate"
+version = "0.1.0"
+description = "Checkpointed Android folder backup and sync over adb."
+readme = "PLAN.md"
+requires-python = ">=3.12"
+authors = [{ name = "Codex" }]
+
+[project.scripts]
+androidmigrate = "androidmigrate.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
