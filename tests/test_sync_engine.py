@@ -17,11 +17,14 @@ class FakeTransport:
                 self.files[path] = {"content": content, "mtime": mtime}
         self.push_calls = 0
         self.pull_calls = 0
+        self.probe_error: Exception | None = None
 
     def list_devices(self):
         return []
 
     def probe_device(self, serial: str) -> None:
+        if self.probe_error is not None:
+            raise self.probe_error
         return None
 
     def scan_root(self, serial: str, device_path: str):
@@ -210,3 +213,120 @@ def test_checkpoint_summary_persists_real_checkpoint_id(tmp_path: Path) -> None:
 
     assert summary.checkpoint_id == 1
     assert '"checkpoint_id": 1' in checkpoint.summary_json
+
+
+def test_missing_local_root_reseeds_from_phone(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        {
+            "/sdcard/DCIM/Camera/a.jpg": (b"a1", 100),
+            "/sdcard/DCIM/Screenshots/b.png": (b"b1", 120),
+        }
+    )
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+
+    local_root = tmp_path / "mirror" / "dcim"
+    for child in sorted(local_root.rglob("*"), reverse=True):
+        if child.is_file():
+            child.unlink()
+        else:
+            child.rmdir()
+    local_root.rmdir()
+
+    summary = engine.sync_profile("demo")
+    issues = engine.list_issues("demo")
+
+    assert summary.pulled == 2
+    assert summary.divergences == 0
+    assert issues == []
+    assert (local_root / "Camera" / "a.jpg").read_bytes() == b"a1"
+    assert (local_root / "Screenshots" / "b.png").read_bytes() == b"b1"
+
+
+def test_existing_empty_root_directory_does_not_auto_reseed(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"a1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+
+    local_file = tmp_path / "mirror" / "dcim" / "Camera" / "a.jpg"
+    local_file.unlink()
+
+    summary = engine.sync_profile("demo")
+
+    assert summary.pulled == 0
+    assert summary.divergences == 1
+
+
+def test_missing_local_root_with_unavailable_device_suggests_repair(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"a1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+
+    local_root = tmp_path / "mirror" / "dcim"
+    for child in sorted(local_root.rglob("*"), reverse=True):
+        if child.is_file():
+            child.unlink()
+        else:
+            child.rmdir()
+    local_root.rmdir()
+    transport.probe_error = RuntimeError("device offline")
+
+    try:
+        engine.sync_profile("demo")
+    except ValueError as exc:
+        assert "repair-local demo" in str(exc)
+    else:
+        raise AssertionError("expected sync failure with repair guidance")
+
+
+def test_repair_local_rebuilds_from_latest_checkpoint_without_touching_phone(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+    before_checkpoints = len(repository.list_checkpoints(1))
+
+    transport.files["/sdcard/DCIM/Camera/a.jpg"] = {"content": b"v2", "mtime": 200}
+    local_root = tmp_path / "mirror" / "dcim"
+    for child in sorted(local_root.rglob("*"), reverse=True):
+        if child.is_file():
+            child.unlink()
+        else:
+            child.rmdir()
+    local_root.rmdir()
+
+    summary = engine.repair_local("demo")
+
+    assert summary.checkpoint_id is None
+    assert (local_root / "Camera" / "a.jpg").read_bytes() == b"v1"
+    assert transport.files["/sdcard/DCIM/Camera/a.jpg"]["content"] == b"v2"
+    assert len(repository.list_checkpoints(1)) == before_checkpoints
+    runs = repository.list_recent_runs(1)
+    assert runs[0].operation_type == "repair_local"
+    assert runs[0].status == "completed"
+
+
+def test_repair_local_fails_when_required_blob_is_missing(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+
+    checkpoint_id = repository.list_checkpoints(1)[0].id
+    entry = repository.list_checkpoint_entries(checkpoint_id, 1)[0]
+    blob_path = BlobStore(tmp_path / "state").path_for_hash(entry["blob_hash"])
+    blob_path.unlink()
+
+    local_root = tmp_path / "mirror" / "dcim"
+    for child in sorted(local_root.rglob("*"), reverse=True):
+        if child.is_file():
+            child.unlink()
+        else:
+            child.rmdir()
+    local_root.rmdir()
+
+    try:
+        engine.repair_local("demo")
+    except ValueError as exc:
+        assert "Missing blob for local repair" in str(exc)
+    else:
+        raise AssertionError("expected repair-local failure when blob is missing")
+    assert not local_root.exists()

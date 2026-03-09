@@ -22,6 +22,7 @@ PROFILE_RESTORE_INCOMPLETE = "restore_incomplete"
 RUN_SYNC = "sync"
 RUN_RESTORE = "restore"
 RUN_CLONE_RESTORE = "clone_restore"
+RUN_REPAIR_LOCAL = "repair_local"
 RUN_RESOLVE = "resolve"
 
 RUN_RUNNING = "running"

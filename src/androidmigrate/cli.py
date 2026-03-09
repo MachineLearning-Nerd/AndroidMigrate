@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--path")
     restore.add_argument("--to-device", action="store_true")
 
+    repair_local = subparsers.add_parser("repair-local", help="Rebuild the local mirror from checkpoint data")
+    repair_local.add_argument("name")
+    repair_local.add_argument("--root")
+    repair_local.add_argument("--checkpoint", type=int)
+
     clone_restore = subparsers.add_parser("clone-restore", help="Clone a checkpoint to a different device")
     clone_restore.add_argument("name")
     clone_restore.add_argument("checkpoint_id", type=int)
@@ -96,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
             if not args.to_device:
                 raise ValueError("restore currently requires --to-device")
             summary = engine.restore_checkpoint(args.name, args.checkpoint_id, root_label=args.root, relative_path=args.path)
+            print(summary_to_text(summary))
+            return 0
+        if args.command == "repair-local":
+            summary = engine.repair_local(args.name, checkpoint_id=args.checkpoint, root_label=args.root)
             print(summary_to_text(summary))
             return 0
         if args.command == "clone-restore":

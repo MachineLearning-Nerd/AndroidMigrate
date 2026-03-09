@@ -274,6 +274,16 @@ class RootManagerController:
                     )
         return None
 
+    def staged_summary(self) -> str:
+        additions = ", ".join(sorted(item.label for item in self.state.staged_additions.values())) or "none"
+        lifecycle_changes = []
+        for root in self._roots:
+            target = self.state.staged_lifecycle.get(root.id)
+            if target is not None and target != root.lifecycle:
+                lifecycle_changes.append(f"{root.label}={target}")
+        lifecycle = ", ".join(lifecycle_changes) or "none"
+        return f"adds: {additions} | lifecycle: {lifecycle}"
+
     def browser_marker(self, entry: RemoteDirectoryEntry) -> str:
         path = entry.absolute_path
         if path in self.state.staged_additions:
@@ -283,18 +293,18 @@ class RootManagerController:
             return " "
         lifecycle = self.current_root_state(root)
         return {
-            ROOT_ACTIVE: "*",
-            ROOT_DISABLED: "d",
-            ROOT_REMOVED: "r",
+            ROOT_ACTIVE: "A",
+            ROOT_DISABLED: "D",
+            ROOT_REMOVED: "R",
         }[lifecycle]
 
     def root_marker(self, root: SyncRoot) -> str:
         lifecycle = self.current_root_state(root)
         staged = self.state.staged_lifecycle.get(root.id)
         marker = {
-            ROOT_ACTIVE: "*",
-            ROOT_DISABLED: "d",
-            ROOT_REMOVED: "r",
+            ROOT_ACTIVE: "A",
+            ROOT_DISABLED: "D",
+            ROOT_REMOVED: "R",
         }[lifecycle]
         if staged is not None and staged != root.lifecycle:
             marker = f"{marker}+"

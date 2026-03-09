@@ -23,6 +23,7 @@ from .models import (
     RUN_CLONE_RESTORE,
     RUN_COMPLETED,
     RUN_FAILED,
+    RUN_REPAIR_LOCAL,
     RUN_RESOLVE,
     RUN_RESTORE,
     RUN_SYNC,
@@ -156,10 +157,21 @@ class SyncEngine:
         run_id = None if dry_run else self.repository.start_run(profile.id, RUN_SYNC, summary=summary.to_dict())
         logger = RunLogger(self.repository, run_id, RUN_SYNC, event_sink)
         root_results: list[RootSyncResult] = []
+        missing_local_roots = self._roots_missing_local_history(profile, roots)
 
         try:
             logger.emit("probe", "running", f"Probing device {profile.device_serial}")
-            self.transport.probe_device(profile.device_serial)
+            try:
+                self.transport.probe_device(profile.device_serial)
+            except Exception as exc:
+                if missing_local_roots:
+                    labels = ", ".join(root.label for root in missing_local_roots)
+                    raise ValueError(
+                        f"Local backup root(s) missing for profile {profile.name}: {labels}. "
+                        f"Device is unavailable. Run 'androidmigrate repair-local {profile.name}' "
+                        "to rebuild from the latest checkpoint."
+                    ) from exc
+                raise
             logger.emit("probe", "completed", f"Device {profile.device_serial} is ready")
 
             for root in roots:
@@ -190,6 +202,86 @@ class SyncEngine:
                 logger.emit("run", "failed", str(exc))
                 self.repository.finalize_run(run_id, RUN_FAILED, summary={"error": str(exc), **summary.to_dict()})
                 self.repository.prune_runs(profile.id)
+            raise
+
+    def repair_local(
+        self,
+        profile_name: str,
+        checkpoint_id: int | None = None,
+        root_label: str | None = None,
+        event_sink: EventSink | None = None,
+    ) -> SyncSummary:
+        profile = self.repository.get_profile(profile_name)
+        checkpoints = self.repository.list_checkpoints(profile.id)
+        if not checkpoints:
+            raise ValueError(f"Profile {profile.name} has no checkpoints to repair from")
+        if checkpoint_id is None:
+            checkpoint_id = checkpoints[0].id
+        self.repository.get_checkpoint(profile.id, checkpoint_id)
+        checkpoint_roots = self.repository.list_checkpoint_roots(profile.id, checkpoint_id)
+        if not checkpoint_roots:
+            raise ValueError(f"Checkpoint {checkpoint_id} has no roots")
+
+        selected_checkpoint_roots = checkpoint_roots
+        if root_label is not None:
+            selected_checkpoint_roots = [root for root in checkpoint_roots if root.label == root_label]
+            if not selected_checkpoint_roots:
+                raise ValueError(f"Checkpoint {checkpoint_id} has no root labeled {root_label}")
+
+        selected_roots = [self.repository.get_root_by_id(root.id) for root in selected_checkpoint_roots]
+        run_id = self.repository.start_run(
+            profile.id,
+            RUN_REPAIR_LOCAL,
+            source_profile_id=profile.id,
+            source_checkpoint_id=checkpoint_id,
+            summary={"checkpoint_id": checkpoint_id, "root_label": root_label},
+        )
+        logger = RunLogger(self.repository, run_id, RUN_REPAIR_LOCAL, event_sink)
+        summary = SyncSummary(profile_name=profile.name)
+
+        try:
+            logger.emit("preflight", "running", f"Preparing local repair from checkpoint {checkpoint_id}")
+            desired_entries_by_root: dict[int, list[dict[str, object]]] = {}
+            for root in selected_roots:
+                entries = list(self.repository.list_checkpoint_entries(checkpoint_id, root.id))
+                for entry in entries:
+                    blob_path = self.blob_store.path_for_hash(entry["blob_hash"])
+                    if not blob_path.exists():
+                        raise ValueError(f"Missing blob for local repair: {entry['blob_hash']}")
+                desired_entries_by_root[root.id] = entries
+            logger.emit("preflight", "completed", f"Local repair preflight passed for checkpoint {checkpoint_id}")
+
+            all_states: list[FileState] = []
+            for root in selected_roots:
+                summary.roots_scanned += 1
+                logger.emit("repair_root", "running", f"Repairing local root {root.label}", root=root)
+                root_states = self._repair_local_root(
+                    profile,
+                    root,
+                    checkpoint_id,
+                    desired_entries_by_root[root.id],
+                    summary,
+                    logger,
+                )
+                all_states.extend(root_states)
+                logger.emit("repair_root", "completed", f"Repaired local root {root.label}", root=root)
+
+            self.repository.save_file_states(all_states)
+            self.repository.finalize_run(
+                run_id,
+                RUN_COMPLETED,
+                summary={"checkpoint_id": checkpoint_id, "root_label": root_label, **summary.to_dict()},
+            )
+            self.repository.prune_runs(profile.id)
+            return summary
+        except Exception as exc:
+            logger.emit("repair_local", "failed", str(exc))
+            self.repository.finalize_run(
+                run_id,
+                RUN_FAILED,
+                summary={"checkpoint_id": checkpoint_id, "root_label": root_label, "error": str(exc), **summary.to_dict()},
+            )
+            self.repository.prune_runs(profile.id)
             raise
 
     def list_issues(self, profile_name: str) -> list[tuple[SyncRoot, FileState]]:
@@ -617,6 +709,16 @@ class SyncEngine:
         previous_states = self.repository.list_file_states(profile.id, root.id)
         device_files = self.transport.scan_root(profile.device_serial, root.device_path)
         local_dir = local_root_path(profile, root)
+        if previous_states and not local_dir.exists():
+            return self._reseed_missing_local_root(
+                profile,
+                root,
+                previous_states,
+                device_files,
+                dry_run,
+                summary,
+                logger,
+            )
         local_files = scan_local_root(local_dir)
         result_states: list[FileState] = []
 
@@ -646,6 +748,197 @@ class SyncEngine:
             if state.device_present and state.device_hash and state.device_size is not None and state.device_mtime is not None
         ]
         return RootSyncResult(states=result_states, checkpoint_entries=checkpoint_entries)
+
+    def _reseed_missing_local_root(
+        self,
+        profile: Profile,
+        root: SyncRoot,
+        previous_states: dict[str, FileState],
+        device_files: dict[str, FileMetadata],
+        dry_run: bool,
+        summary: SyncSummary,
+        logger: RunLogger,
+    ) -> RootSyncResult:
+        local_dir = local_root_path(profile, root)
+        logger.emit(
+            "missing_local_root_detected",
+            "running",
+            f"Local root {root.label} is missing; rebuilding from phone",
+            root=root,
+            action="reseed_local_from_phone",
+        )
+        if not dry_run:
+            local_dir.mkdir(parents=True, exist_ok=True)
+
+        result_states: list[FileState] = []
+        for relative_path in sorted(set(previous_states) | set(device_files)):
+            summary.files_seen += 1
+            if relative_path in device_files:
+                state = self._pull_from_device(
+                    profile,
+                    root,
+                    relative_path,
+                    device_files[relative_path],
+                    dry_run,
+                    summary,
+                    logger,
+                    previous_states.get(relative_path),
+                )
+            else:
+                summary.removed += 1
+                logger.emit(
+                    "reseed_local_from_phone",
+                    "completed",
+                    f"Marked {relative_path} removed during local rebuild",
+                    root=root,
+                    relative_path=relative_path,
+                    action="reseed_remove",
+                )
+                previous = previous_states.get(relative_path)
+                state = FileState(
+                    id=previous.id if previous else None,
+                    profile_id=profile.id,
+                    root_id=root.id,
+                    relative_path=relative_path,
+                    status=REMOVED,
+                    device_present=False,
+                    device_hash=None,
+                    device_size=None,
+                    device_mtime=None,
+                    local_present=False,
+                    local_hash=None,
+                    local_size=None,
+                    local_mtime=None,
+                    conflict_copy_path=None,
+                    updated_at=utc_now(),
+                    last_synced_checkpoint_id=previous.last_synced_checkpoint_id if previous else None,
+                    last_restored_from_checkpoint_id=previous.last_restored_from_checkpoint_id if previous else None,
+                )
+            result_states.append(state)
+
+        logger.emit(
+            "reseed_local_from_phone",
+            "completed",
+            f"Rebuilt local root {root.label} from phone",
+            root=root,
+            action="reseed_local_from_phone",
+        )
+        checkpoint_entries = [
+            {
+                "root_id": root.id,
+                "relative_path": state.relative_path,
+                "blob_hash": state.device_hash,
+                "size": state.device_size,
+                "device_mtime": state.device_mtime,
+            }
+            for state in result_states
+            if state.device_present and state.device_hash and state.device_size is not None and state.device_mtime is not None
+        ]
+        return RootSyncResult(states=result_states, checkpoint_entries=checkpoint_entries)
+
+    def _repair_local_root(
+        self,
+        profile: Profile,
+        root: SyncRoot,
+        checkpoint_id: int,
+        desired_entries: list[dict[str, object]],
+        summary: SyncSummary,
+        logger: RunLogger,
+    ) -> list[FileState]:
+        local_dir = local_root_path(profile, root)
+        previous_states = self.repository.list_file_states(profile.id, root.id)
+        current_local = scan_local_root(local_dir)
+        desired_map = {row["relative_path"]: row for row in desired_entries}
+        root_states: dict[str, FileState] = {}
+
+        local_dir.mkdir(parents=True, exist_ok=True)
+        for relpath in sorted(set(current_local) - set(desired_map)):
+            logger.emit(
+                "repair_local_from_checkpoint",
+                "running",
+                f"Deleting extra local file {relpath}",
+                root=root,
+                relative_path=relpath,
+                action="delete_local",
+            )
+            target = local_dir / relpath
+            if target.exists():
+                target.unlink()
+            summary.removed += 1
+
+        for relpath, row in desired_map.items():
+            blob_path = self.blob_store.path_for_hash(row["blob_hash"])
+            target = local_dir / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(blob_path, target)
+            local_stat = FileMetadata(
+                relative_path=relpath,
+                size=target.stat().st_size,
+                mtime=int(target.stat().st_mtime),
+                absolute_path=str(target),
+            )
+            previous = previous_states.get(relpath)
+            root_states[relpath] = FileState(
+                id=previous.id if previous else None,
+                profile_id=profile.id,
+                root_id=root.id,
+                relative_path=relpath,
+                status=IN_SYNC,
+                device_present=True,
+                device_hash=row["blob_hash"],
+                device_size=row["size"],
+                device_mtime=row["device_mtime"],
+                local_present=True,
+                local_hash=row["blob_hash"],
+                local_size=local_stat.size,
+                local_mtime=local_stat.mtime,
+                conflict_copy_path=None,
+                updated_at=utc_now(),
+                last_synced_checkpoint_id=checkpoint_id,
+                last_restored_from_checkpoint_id=checkpoint_id,
+            )
+            summary.files_seen += 1
+            logger.emit(
+                "repair_local_from_checkpoint",
+                "completed",
+                f"Repaired {root.label}/{relpath}",
+                root=root,
+                relative_path=relpath,
+                action="copy_blob",
+            )
+
+        for relpath in sorted((set(previous_states) | set(current_local)) - set(desired_map)):
+            previous = previous_states.get(relpath)
+            root_states[relpath] = FileState(
+                id=previous.id if previous else None,
+                profile_id=profile.id,
+                root_id=root.id,
+                relative_path=relpath,
+                status=REMOVED,
+                device_present=False,
+                device_hash=None,
+                device_size=None,
+                device_mtime=None,
+                local_present=False,
+                local_hash=None,
+                local_size=None,
+                local_mtime=None,
+                conflict_copy_path=None,
+                updated_at=utc_now(),
+                last_synced_checkpoint_id=checkpoint_id,
+                last_restored_from_checkpoint_id=checkpoint_id,
+            )
+
+        return list(root_states.values())
+
+    def _roots_missing_local_history(self, profile: Profile, roots: list[SyncRoot]) -> list[SyncRoot]:
+        missing: list[SyncRoot] = []
+        for root in roots:
+            if local_root_path(profile, root).exists():
+                continue
+            if self.repository.list_file_states(profile.id, root.id):
+                missing.append(root)
+        return missing
 
     def _sync_path(
         self,
