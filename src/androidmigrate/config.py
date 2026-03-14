@@ -2,18 +2,69 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path, PurePosixPath
 
 from .models import Profile, SyncRoot
 
 
 ENV_STATE_DIR = "ANDROIDMIGRATE_HOME"
+POINTER_DIR = Path.home() / ".config" / "androidmigrate"
+POINTER_FILE = POINTER_DIR / "home"
+STATE_SUBDIR = ".androidmigrate"
+
+
+def read_pointer_file() -> Path | None:
+    try:
+        text = POINTER_FILE.read_text().strip()
+        if text:
+            return Path(text)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def write_pointer_file(base_path: Path) -> None:
+    POINTER_DIR.mkdir(parents=True, exist_ok=True)
+    POINTER_FILE.write_text(str(base_path.resolve()) + "\n")
+
+
+def state_dir_for_base(base_path: Path) -> Path:
+    return base_path / STATE_SUBDIR
+
+
+def relocate_state(old_state_dir: Path, new_state_dir: Path) -> None:
+    old_state_dir = old_state_dir.resolve()
+    new_state_dir = new_state_dir.resolve()
+    if old_state_dir == new_state_dir:
+        return
+    old_db = old_state_dir / "state.db"
+    if not old_db.exists():
+        return
+    new_db = new_state_dir / "state.db"
+    if new_db.exists():
+        raise FileExistsError(f"State database already exists at {new_db}")
+    new_state_dir.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        src = old_state_dir / f"state.db{suffix}"
+        if src.exists():
+            shutil.move(str(src), str(new_state_dir / src.name))
+    old_blobs = old_state_dir / "blobs"
+    if old_blobs.exists():
+        shutil.move(str(old_blobs), str(new_state_dir / "blobs"))
+    try:
+        old_state_dir.rmdir()
+    except OSError:
+        pass
 
 
 def get_state_dir() -> Path:
     raw = os.environ.get(ENV_STATE_DIR)
     if raw:
         return Path(raw).expanduser()
+    pointer = read_pointer_file()
+    if pointer:
+        return state_dir_for_base(pointer)
     return Path.cwd() / ".androidmigrate"
 
 

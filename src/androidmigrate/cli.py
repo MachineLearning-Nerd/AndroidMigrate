@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 
-from .config import derive_label, get_state_dir, unique_label
+from .config import ENV_STATE_DIR, derive_label, get_state_dir, relocate_state, state_dir_for_base, unique_label, write_pointer_file
 from .storage import BlobStore, Repository
 from .sync_engine import SyncEngine, summary_to_text
 from .transport import ADBTransport, TransportError
+
+
+def _has_explicit_state_dir(argv: list[str]) -> bool:
+    return bool(os.environ.get(ENV_STATE_DIR)) or any(a.startswith("--state-dir") for a in argv)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,7 +84,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    state_dir = Path(args.state_dir).expanduser()
+    explicit = _has_explicit_state_dir(argv or sys.argv[1:])
+
+    if not explicit and args.command == "profile" and args.profile_command == "create":
+        mirror_base = Path(args.mirror_dir).expanduser().resolve()
+        state_dir = state_dir_for_base(mirror_base)
+        old_state_dir = Path(args.state_dir).expanduser()
+        if old_state_dir != state_dir and (old_state_dir / "state.db").exists():
+            relocate_state(old_state_dir, state_dir)
+        write_pointer_file(mirror_base)
+    elif not explicit and args.command == "clone-restore":
+        mirror_base = Path(args.mirror_dir).expanduser().resolve()
+        state_dir = state_dir_for_base(mirror_base)
+        write_pointer_file(mirror_base)
+    else:
+        state_dir = Path(args.state_dir).expanduser()
+
     repository = Repository(state_dir)
     blob_store = BlobStore(state_dir)
     transport = ADBTransport()
@@ -126,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "tui":
             from .tui import run_tui
 
-            return run_tui(repository, blob_store, transport)
+            return run_tui(repository, blob_store, transport, state_dir_explicit=explicit)
     except (ValueError, TransportError) as exc:
         parser.exit(status=2, message=f"error: {exc}\n")
     finally:

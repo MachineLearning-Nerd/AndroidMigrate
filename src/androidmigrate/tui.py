@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .config import relocate_state, state_dir_for_base, write_pointer_file
 from .mirror_path import autocomplete_directory_input, validate_target_mirror_path
 from .models import PROFILE_ACTIVE, PROFILE_PENDING_CLONE
 from .root_manager import ROOT_BROWSER, RootManagerController
@@ -460,6 +461,7 @@ class CreateProfileScreen:
         self.repository = repository
         self.transport = transport
         self.theme = theme
+        self.created_mirror_base: Path | None = None
         self.state = CreateProfileState()
         self.state.existing_names = {p.name for p in repository.list_profiles()}
         self._refresh_devices()
@@ -712,6 +714,7 @@ class CreateProfileScreen:
             self.state.status_message = f"Unable to create mirror directory: {exc}"
             return None
 
+        self.created_mirror_base = Path(self.state.mirror_text.strip()).expanduser().resolve()
         return f"Saved new profile {name}"
 
     def _show_confirmation(self, title: str, lines: list[str]) -> bool:
@@ -838,12 +841,14 @@ class CreateProfileScreen:
 
 
 class DashboardApp:
-    def __init__(self, stdscr, repository: Repository, blob_store: BlobStore, transport: ADBTransport) -> None:
+    def __init__(self, stdscr, repository: Repository, blob_store: BlobStore, transport: ADBTransport, state_dir_explicit: bool = False) -> None:
         self.stdscr = stdscr
         self.repository = repository
+        self.blob_store = blob_store
         self.transport = transport
         self.engine = SyncEngine(repository, blob_store, transport)
         self.state = DashboardState()
+        self.state_dir_explicit = state_dir_explicit
         self.devices = []
         self.profiles = []
         self.theme = None
@@ -857,6 +862,22 @@ class DashboardApp:
             self.state.selected_profile = max(0, min(self.state.selected_profile, len(self.profiles) - 1))
         else:
             self.state.selected_profile = 0
+
+    def _maybe_relocate_state(self, mirror_base: Path) -> None:
+        if self.state_dir_explicit:
+            return
+        new_state_dir = state_dir_for_base(mirror_base)
+        old_state_dir = self.repository.state_dir
+        if old_state_dir.resolve() == new_state_dir.resolve():
+            write_pointer_file(mirror_base)
+            return
+        self.repository.close()
+        relocate_state(old_state_dir, new_state_dir)
+        write_pointer_file(mirror_base)
+        self.repository = Repository(new_state_dir)
+        new_blob_store = BlobStore(new_state_dir)
+        self.blob_store = new_blob_store
+        self.engine = SyncEngine(self.repository, new_blob_store, self.transport)
 
     def run(self) -> int:
         curses.curs_set(0)
@@ -1141,7 +1162,10 @@ class DashboardApp:
         self.state.status_message = status
 
     def create_profile(self) -> None:
-        status = CreateProfileScreen(self.stdscr, self.repository, self.transport, self.theme).run()
+        screen = CreateProfileScreen(self.stdscr, self.repository, self.transport, self.theme)
+        status = screen.run()
+        if status and screen.created_mirror_base is not None:
+            self._maybe_relocate_state(screen.created_mirror_base)
         self.refresh()
         if status:
             self.state.status_message = status
@@ -1309,9 +1333,13 @@ class DashboardApp:
         del win
 
 
-def run_tui(repository: Repository, blob_store: BlobStore, transport: ADBTransport) -> int:
+def run_tui(repository: Repository, blob_store: BlobStore, transport: ADBTransport, state_dir_explicit: bool = False) -> int:
     def _wrapped(stdscr) -> int:
-        app = DashboardApp(stdscr, repository, blob_store, transport)
-        return app.run()
+        app = DashboardApp(stdscr, repository, blob_store, transport, state_dir_explicit)
+        try:
+            return app.run()
+        finally:
+            if app.repository is not repository:
+                app.repository.close()
 
     return curses.wrapper(_wrapped)
