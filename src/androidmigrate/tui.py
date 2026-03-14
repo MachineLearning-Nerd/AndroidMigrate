@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import curses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
-from .models import PROFILE_ACTIVE
+from .mirror_path import autocomplete_directory_input, validate_target_mirror_path
+from .models import PROFILE_ACTIVE, PROFILE_PENDING_CLONE
 from .root_manager import ROOT_BROWSER, RootManagerController
 from .storage import BlobStore, Repository
 from .sync_engine import SyncEngine
@@ -38,6 +40,15 @@ class DashboardState:
     selected_profile: int = 0
     status_message: str = "Press ? for help"
     last_refresh_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class MirrorPathState:
+    input_text: str
+    preview_source: str = "Checking source..."
+    status_message: str = "Type the exact new backup folder path"
+    suggestions: list[str] = field(default_factory=list)
+    suggestion_index: int = 0
 
 
 def _visible_bounds(selected: int, total: int, max_rows: int) -> tuple[int, int]:
@@ -224,6 +235,203 @@ class RootManagerScreen:
         safe_addstr(self.stdscr, height - 1, 2, truncate_right(text, width - 4), self.theme.footer)
 
 
+class MirrorPathScreen:
+    def __init__(self, stdscr, profile, engine: SyncEngine, theme) -> None:
+        self.stdscr = stdscr
+        self.profile = profile
+        self.engine = engine
+        self.theme = theme
+        self.state = MirrorPathState(input_text=str(profile.mirror_dir))
+        self.refresh_preview()
+        self._refresh_validation_message()
+
+    def run(self) -> tuple[Path | None, str]:
+        while True:
+            self.draw()
+            ch = self.stdscr.getch()
+            if ch in (ord("q"), 27):
+                if self.state.suggestions:
+                    self.state.suggestions.clear()
+                    self.state.status_message = "Dismissed suggestions"
+                    continue
+                return None, "Cancelled backup-folder change"
+            if ch == ord("r"):
+                self.refresh_preview()
+                self._refresh_validation_message()
+                continue
+            if ch in (curses.KEY_UP, ord("k")) and self.state.suggestions:
+                self.state.suggestion_index = max(0, self.state.suggestion_index - 1)
+                continue
+            if ch in (curses.KEY_DOWN, ord("j")) and self.state.suggestions:
+                self.state.suggestion_index = min(len(self.state.suggestions) - 1, self.state.suggestion_index + 1)
+                continue
+            if ch == 9:
+                result = autocomplete_directory_input(self.state.input_text)
+                self.state.input_text = result.updated_text
+                self.state.suggestions = result.suggestions
+                self.state.suggestion_index = 0
+                self.state.status_message = result.message
+                continue
+            if ch in (curses.KEY_ENTER, 10, 13):
+                if self.state.suggestions:
+                    self.state.input_text = self.state.suggestions[self.state.suggestion_index]
+                    self.state.suggestions.clear()
+                    self._refresh_validation_message()
+                    continue
+                validation = validate_target_mirror_path(self.state.input_text, self.profile.mirror_dir)
+                self.state.status_message = validation.message
+                if not validation.ok:
+                    continue
+                if validation.is_noop:
+                    return None, validation.message
+                assert validation.target_path is not None
+                if self._confirm(validation.target_path):
+                    return validation.target_path, f"Changing backup folder to {validation.target_path}"
+                self.state.status_message = "Backup-folder change not confirmed"
+                continue
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if self.state.input_text:
+                    self.state.input_text = self.state.input_text[:-1]
+                self.state.suggestions.clear()
+                self._refresh_validation_message()
+                continue
+            if ch == 21:
+                self.state.input_text = ""
+                self.state.suggestions.clear()
+                self.state.status_message = "Cleared backup folder path"
+                continue
+            if 32 <= ch <= 126:
+                self.state.input_text += chr(ch)
+                self.state.suggestions.clear()
+                self._refresh_validation_message()
+
+    def refresh_preview(self) -> None:
+        try:
+            self.state.preview_source = self.engine.preview_change_mirror_source(self.profile.name)
+        except (ValueError, TransportError) as exc:
+            self.state.preview_source = f"Unavailable: {exc}"
+
+    def draw(self) -> None:
+        self.stdscr.erase()
+        height, width = self.stdscr.getmaxyx()
+        if height < MIN_HEIGHT or width < MIN_WIDTH:
+            _draw_resize_overlay(self.stdscr, height, width, f"Resize terminal to at least {MIN_WIDTH}x{MIN_HEIGHT}")
+            return
+
+        self._draw_header(
+            f"Change Backup Folder  {self.profile.name}",
+            f"device={self.profile.device_serial}",
+        )
+        self._draw_banner(Banner(self.state.status_message, infer_message_tone(self.state.status_message)))
+
+        current_y, current_x, current_h, current_w = draw_panel(
+            self.stdscr,
+            self.theme,
+            3,
+            1,
+            6,
+            width - 2,
+            "Current + Target",
+        )
+        draw_key_value(self.stdscr, self.theme, current_y, current_x + 1, current_w - 2, "Current", str(self.profile.mirror_dir), value_mode="left")
+        draw_key_value(
+            self.stdscr,
+            self.theme,
+            current_y + 1,
+            current_x + 1,
+            current_w - 2,
+            "Target",
+            self.state.input_text or "(empty)",
+            value_mode="left",
+        )
+        draw_key_value(
+            self.stdscr,
+            self.theme,
+            current_y + 2,
+            current_x + 1,
+            current_w - 2,
+            "Rebuild",
+            self.state.preview_source,
+            value_mode="left",
+        )
+        safe_addstr(
+            self.stdscr,
+            current_y + 4,
+            current_x + 1,
+            truncate_right("Old backup folder stays untouched. Only the active mirror path will change.", current_w - 2),
+            self.theme.muted,
+        )
+
+        suggestions_y, suggestions_x, suggestions_h, suggestions_w = draw_panel(
+            self.stdscr,
+            self.theme,
+            9,
+            1,
+            max(8, height - 12),
+            width - 2,
+            "Directory Suggestions",
+            note=format_scroll_label(0, min(len(self.state.suggestions), max(1, height - 14)), len(self.state.suggestions)),
+        )
+        if not self.state.suggestions:
+            draw_centered_placeholder(self.stdscr, suggestions_y, suggestions_x, suggestions_h, suggestions_w, "Press Tab for directory autocomplete", self.theme.muted)
+        for row, suggestion in enumerate(self.state.suggestions[:suggestions_h]):
+            row_attr = self.theme.selected if row == self.state.suggestion_index else self.theme.text
+            fill_line(self.stdscr, suggestions_y + row, suggestions_x, suggestions_w, row_attr if row_attr == self.theme.selected else self.theme.text)
+            safe_addstr(self.stdscr, suggestions_y + row, suggestions_x + 1, truncate_right(suggestion, suggestions_w - 2), row_attr)
+
+        self._draw_footer("Type path  Tab autocomplete  Up/Down suggestions  Enter confirm  Ctrl+U clear  r refresh source  q back")
+        self.stdscr.refresh()
+
+    def _confirm(self, target_path: Path) -> bool:
+        lines = [
+            f"Current: {self.profile.mirror_dir}",
+            f"Target:  {target_path}",
+            f"Source:  {self.state.preview_source}",
+            "",
+            "Old backup folder stays untouched.",
+            "Press Enter to confirm or q/Esc to cancel.",
+        ]
+        return self._show_confirmation("Confirm Backup Folder Change", lines)
+
+    def _show_confirmation(self, title: str, lines: list[str]) -> bool:
+        height, width = self.stdscr.getmaxyx()
+        box_height = min(max(len(lines) + 4, 8), height - 4)
+        box_width = min(max(max(len(line) for line in lines) + 4, 56), width - 4)
+        top = max(0, (height - box_height) // 2)
+        left = max(0, (width - box_width) // 2)
+
+        while True:
+            draw_panel(self.stdscr, self.theme, top, left, box_height, box_width, title, focused=True)
+            for row, line in enumerate(lines[: max(0, box_height - 2)]):
+                safe_addstr(self.stdscr, top + 1 + row, left + 1, truncate_right(line, box_width - 2), self.theme.text)
+            self.stdscr.refresh()
+            ch = self.stdscr.getch()
+            if ch in (curses.KEY_ENTER, 10, 13):
+                return True
+            if ch in (ord("q"), 27):
+                return False
+
+    def _refresh_validation_message(self) -> None:
+        validation = validate_target_mirror_path(self.state.input_text, self.profile.mirror_dir)
+        self.state.status_message = validation.message
+
+    def _draw_header(self, title: str, subtitle: str) -> None:
+        width = self.stdscr.getmaxyx()[1]
+        fill_line(self.stdscr, 0, 0, width, self.theme.header)
+        safe_addstr(self.stdscr, 0, 2, truncate_right(title, width // 2), self.theme.title)
+        safe_addstr(self.stdscr, 0, max(2, width - len(subtitle) - 2), truncate_left(subtitle, width // 2), self.theme.muted)
+
+    def _draw_banner(self, banner: Banner) -> None:
+        width = self.stdscr.getmaxyx()[1]
+        fill_line(self.stdscr, 1, 0, width, tone_attr(self.theme, banner.tone))
+        safe_addstr(self.stdscr, 1, 2, truncate_right(banner.text, width - 4), tone_attr(self.theme, banner.tone))
+
+    def _draw_footer(self, text: str) -> None:
+        height, width = self.stdscr.getmaxyx()
+        fill_line(self.stdscr, height - 1, 0, width, self.theme.footer)
+        safe_addstr(self.stdscr, height - 1, 2, truncate_right(text, width - 4), self.theme.footer)
+
+
 class DashboardApp:
     def __init__(self, stdscr, repository: Repository, blob_store: BlobStore, transport: ADBTransport) -> None:
         self.stdscr = stdscr
@@ -273,6 +481,7 @@ class DashboardApp:
                         "Dashboard",
                         "  j/k or arrows   move between profiles",
                         "  e               edit roots for selected profile",
+                        "  m               change backup folder",
                         "  y               sync selected profile",
                         "  c               view checkpoints",
                         "  i               view issues",
@@ -290,6 +499,9 @@ class DashboardApp:
                 continue
             if ch == ord("e"):
                 self.open_root_manager()
+                continue
+            if ch == ord("m"):
+                self.open_mirror_change()
                 continue
             if ch == ord("c"):
                 self.show_checkpoints()
@@ -494,7 +706,7 @@ class DashboardApp:
             self.stdscr,
             height - 1,
             2,
-            truncate_right("j/k move  e edit roots  y sync  c checkpoints  i issues  l runs  r refresh  ? help  q quit", width - 4),
+            truncate_right("j/k move  e edit roots  m backup folder  y sync  c checkpoints  i issues  l runs  r refresh  ? help  q quit", width - 4),
             self.theme.footer,
         )
 
@@ -518,6 +730,48 @@ class DashboardApp:
         status = RootManagerScreen(self.stdscr, controller, self.theme).run()
         self.refresh()
         self.state.status_message = status
+
+    def open_mirror_change(self) -> None:
+        profile = self.selected_profile()
+        if profile is None:
+            self.state.status_message = "No profile selected"
+            return
+        if profile.profile_state == PROFILE_PENDING_CLONE:
+            self.state.status_message = f"Profile {profile.name} cannot change backup folder while clone restore is pending"
+            return
+
+        target_path, status = MirrorPathScreen(self.stdscr, profile, self.engine, self.theme).run()
+        if target_path is None:
+            self.state.status_message = status
+            return
+
+        logs: list[str] = []
+        stats = {"events": 0, "completed": 0, "failed": 0, "latest": "Preparing backup-folder change"}
+
+        def sink(event: dict[str, object]) -> None:
+            stats["events"] += 1
+            if event["status"] == "completed":
+                stats["completed"] += 1
+            elif event["status"] == "failed":
+                stats["failed"] += 1
+            stats["latest"] = str(event["message"])
+            logs.append(f"{event['stage']} [{event['status']}] {event['message']}")
+            self.draw_run_screen(f"Change Backup Folder: {profile.name}", logs, stats, run_state="running")
+
+        try:
+            self.engine.change_mirror_path(profile.name, target_path, event_sink=sink)
+            stats["latest"] = f"Backup folder changed to {target_path}"
+            self.draw_run_screen(f"Change Backup Folder: {profile.name}", logs, stats, run_state="completed")
+            self.state.status_message = f"Changed backup folder for {profile.name} to {target_path}"
+        except (ValueError, TransportError) as exc:
+            logs.append(f"change_mirror [failed] {exc}")
+            stats["failed"] += 1
+            stats["latest"] = str(exc)
+            self.draw_run_screen(f"Change Backup Folder: {profile.name}", logs, stats, run_state="failed")
+            self.state.status_message = f"Backup-folder change failed for {profile.name}: {exc}"
+            self.stdscr.getch()
+        finally:
+            self.refresh()
 
     def run_sync(self) -> None:
         profile = self.selected_profile()

@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 
+from androidmigrate.models import CONFLICT, PROFILE_PENDING_CLONE, ROOT_DISABLED
 from androidmigrate.storage import BlobStore, Repository
 from androidmigrate.sync_engine import SyncEngine
 from androidmigrate.transport import ADBTransport
@@ -330,3 +331,102 @@ def test_repair_local_fails_when_required_blob_is_missing(tmp_path: Path) -> Non
     else:
         raise AssertionError("expected repair-local failure when blob is missing")
     assert not local_root.exists()
+
+
+def test_change_mirror_path_rebuilds_active_roots_and_copies_disabled_history(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    repository.add_root(1, "/sdcard/Documents", "docs", lifecycle=ROOT_DISABLED)
+    engine.sync_profile("demo")
+
+    old_mirror = tmp_path / "mirror"
+    docs_file = old_mirror / "docs" / "old.txt"
+    docs_file.parent.mkdir(parents=True, exist_ok=True)
+    docs_file.write_text("history")
+    before_checkpoints = len(repository.list_checkpoints(1))
+
+    target_mirror = tmp_path / "mirror-new"
+    engine.change_mirror_path("demo", target_mirror)
+
+    profile = repository.get_profile("demo")
+    assert profile.mirror_dir == target_mirror
+    assert (target_mirror / "dcim" / "Camera" / "a.jpg").read_bytes() == b"v1"
+    assert (target_mirror / "docs" / "old.txt").read_text() == "history"
+    assert docs_file.read_text() == "history"
+    assert (old_mirror / "dcim" / "Camera" / "a.jpg").read_bytes() == b"v1"
+    assert len(repository.list_checkpoints(1)) == before_checkpoints
+    latest_run = repository.list_recent_runs(1)[0]
+    assert latest_run.operation_type == "change_mirror"
+    assert latest_run.status == "completed"
+
+
+def test_change_mirror_path_falls_back_to_checkpoint(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+    before_checkpoints = len(repository.list_checkpoints(1))
+    transport.files["/sdcard/DCIM/Camera/a.jpg"] = {"content": b"v2", "mtime": 200}
+    transport.probe_error = RuntimeError("device offline")
+
+    target_mirror = tmp_path / "checkpoint-fallback"
+    engine.change_mirror_path("demo", target_mirror)
+
+    assert (target_mirror / "dcim" / "Camera" / "a.jpg").read_bytes() == b"v1"
+    assert transport.files["/sdcard/DCIM/Camera/a.jpg"]["content"] == b"v2"
+    assert len(repository.list_checkpoints(1)) == before_checkpoints
+
+
+def test_change_mirror_path_blocks_pending_clone_profile(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    repository.update_profile_state(1, PROFILE_PENDING_CLONE)
+
+    try:
+        engine.change_mirror_path("demo", tmp_path / "new-mirror")
+    except ValueError as exc:
+        assert "pending" in str(exc)
+    else:
+        raise AssertionError("expected pending-clone profile to block mirror change")
+
+
+def test_change_mirror_path_rejects_non_empty_target(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+    target_mirror = tmp_path / "non-empty-target"
+    target_mirror.mkdir(parents=True)
+    (target_mirror / "junk.txt").write_text("junk")
+
+    try:
+        engine.change_mirror_path("demo", target_mirror)
+    except ValueError as exc:
+        assert "must be empty" in str(exc)
+    else:
+        raise AssertionError("expected non-empty target to be rejected")
+    assert repository.get_profile("demo").mirror_dir == tmp_path / "mirror"
+
+
+def test_change_mirror_path_preserves_conflict_archive_for_active_conflict(tmp_path: Path) -> None:
+    transport = FakeTransport({"/sdcard/DCIM/Camera/a.jpg": (b"phone-v1", 100)})
+    repository, engine = setup_engine(tmp_path, transport)
+    engine.sync_profile("demo")
+
+    local_file = tmp_path / "mirror" / "dcim" / "Camera" / "a.jpg"
+    local_file.write_bytes(b"local-v2")
+    os.utime(local_file, (200, 200))
+    transport.files["/sdcard/DCIM/Camera/a.jpg"] = {"content": b"phone-v2", "mtime": 201}
+    engine.sync_profile("demo")
+
+    issue_id = engine.list_issues("demo")[0][1].id
+    old_issue = repository.get_issue(1, issue_id)[1]
+    assert old_issue.status == CONFLICT
+    old_archive = old_issue.conflict_copy_path
+
+    target_mirror = tmp_path / "conflict-target"
+    engine.change_mirror_path("demo", target_mirror)
+
+    new_issue = repository.get_issue(1, issue_id)[1]
+    assert new_issue.status == CONFLICT
+    assert new_issue.conflict_copy_path == old_archive
+    assert Path(old_archive).read_bytes() == b"local-v2"
+    assert (target_mirror / "dcim" / "Camera" / "a.jpg").read_bytes() == b"phone-v2"

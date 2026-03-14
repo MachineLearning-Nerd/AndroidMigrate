@@ -21,6 +21,7 @@ from .models import (
     REMOVED,
     ROOT_ACTIVE,
     RUN_CLONE_RESTORE,
+    RUN_CHANGE_MIRROR,
     RUN_COMPLETED,
     RUN_FAILED,
     RUN_REPAIR_LOCAL,
@@ -280,6 +281,117 @@ class SyncEngine:
                 run_id,
                 RUN_FAILED,
                 summary={"checkpoint_id": checkpoint_id, "root_label": root_label, "error": str(exc), **summary.to_dict()},
+            )
+            self.repository.prune_runs(profile.id)
+            raise
+
+    def preview_change_mirror_source(self, profile_name: str) -> str:
+        profile = self.repository.get_profile(profile_name)
+        if profile.profile_state == PROFILE_PENDING_CLONE:
+            raise ValueError(f"Profile {profile.name} cannot change backup folder while clone restore is pending")
+        source, checkpoint_id = self._determine_change_mirror_source(profile, self.repository.list_active_roots(profile.id))
+        if source == "phone":
+            return "Phone"
+        if source == "checkpoint":
+            return f"Latest checkpoint #{checkpoint_id}"
+        return "Local history only"
+
+    def change_mirror_path(
+        self,
+        profile_name: str,
+        target_mirror_dir: Path,
+        event_sink: EventSink | None = None,
+    ) -> SyncSummary:
+        profile = self.repository.get_profile(profile_name)
+        if profile.profile_state == PROFILE_PENDING_CLONE:
+            raise ValueError(f"Profile {profile.name} cannot change backup folder while clone restore is pending")
+
+        target_mirror_dir = target_mirror_dir.expanduser().resolve()
+        self._validate_target_mirror_dir(profile.mirror_dir, target_mirror_dir)
+        roots = self.repository.list_roots(profile.id)
+        active_roots = [root for root in roots if root.lifecycle == ROOT_ACTIVE]
+        inactive_roots = [root for root in roots if root.lifecycle != ROOT_ACTIVE]
+        source, checkpoint_id = self._determine_change_mirror_source(profile, active_roots)
+        summary = SyncSummary(profile_name=profile.name)
+        run_id = self.repository.start_run(
+            profile.id,
+            RUN_CHANGE_MIRROR,
+            source_profile_id=profile.id,
+            source_checkpoint_id=checkpoint_id,
+            summary={
+                "old_mirror_dir": str(profile.mirror_dir),
+                "target_mirror_dir": str(target_mirror_dir),
+                "rebuild_source": source,
+            },
+        )
+        logger = RunLogger(self.repository, run_id, RUN_CHANGE_MIRROR, event_sink)
+        target_existed = target_mirror_dir.exists()
+        target_profile = self._profile_with_mirror(profile, target_mirror_dir)
+
+        try:
+            logger.emit("preflight", "running", f"Preparing backup-folder change to {target_mirror_dir}")
+            target_mirror_dir.mkdir(parents=True, exist_ok=True)
+            logger.emit("preflight", "completed", f"Using {source.replace('_', ' ')} source for {profile.name}")
+
+            for root in inactive_roots:
+                self._copy_local_history_root(profile, target_profile, root, logger)
+
+            active_states: list[FileState] = []
+            if source == "phone":
+                for root in active_roots:
+                    summary.roots_scanned += 1
+                    logger.emit("mirror_root", "running", f"Rebuilding active root {root.label} from phone", root=root)
+                    active_states.extend(self._rebuild_active_root_from_phone(profile, target_profile, root, summary, logger))
+                    logger.emit("mirror_root", "completed", f"Rebuilt active root {root.label} from phone", root=root)
+            elif source == "checkpoint":
+                assert checkpoint_id is not None
+                for root in active_roots:
+                    summary.roots_scanned += 1
+                    logger.emit(
+                        "mirror_root",
+                        "running",
+                        f"Rebuilding active root {root.label} from checkpoint {checkpoint_id}",
+                        root=root,
+                    )
+                    active_states.extend(
+                        self._restore_active_root_from_checkpoint(profile, target_profile, root, checkpoint_id, summary, logger)
+                    )
+                    logger.emit(
+                        "mirror_root",
+                        "completed",
+                        f"Rebuilt active root {root.label} from checkpoint {checkpoint_id}",
+                        root=root,
+                    )
+
+            self.repository.update_profile_mirror_dir(profile.id, target_mirror_dir)
+            if active_states:
+                self.repository.save_file_states(active_states)
+            logger.emit("change_mirror", "completed", f"Changed backup folder to {target_mirror_dir}")
+            self.repository.finalize_run(
+                run_id,
+                RUN_COMPLETED,
+                summary={
+                    "old_mirror_dir": str(profile.mirror_dir),
+                    "target_mirror_dir": str(target_mirror_dir),
+                    "rebuild_source": source,
+                    **summary.to_dict(),
+                },
+            )
+            self.repository.prune_runs(profile.id)
+            return summary
+        except Exception as exc:
+            self._cleanup_target_mirror_dir(target_mirror_dir, existed_before=target_existed)
+            logger.emit("change_mirror", "failed", str(exc))
+            self.repository.finalize_run(
+                run_id,
+                RUN_FAILED,
+                summary={
+                    "old_mirror_dir": str(profile.mirror_dir),
+                    "target_mirror_dir": str(target_mirror_dir),
+                    "rebuild_source": source,
+                    "error": str(exc),
+                    **summary.to_dict(),
+                },
             )
             self.repository.prune_runs(profile.id)
             raise
@@ -697,6 +809,248 @@ class SyncEngine:
             return self.transport.scan_root(serial, root_path)
         except Exception:
             return {}
+
+    def _copy_local_history_root(
+        self,
+        source_profile: Profile,
+        target_profile: Profile,
+        root: SyncRoot,
+        logger: RunLogger,
+    ) -> None:
+        source_dir = local_root_path(source_profile, root)
+        if not source_dir.exists():
+            return
+        target_dir = local_root_path(target_profile, root)
+        logger.emit("copy_history", "running", f"Copying local history for {root.label}", root=root, action="copy_local_history")
+        shutil.copytree(source_dir, target_dir, dirs_exist_ok=True, copy_function=shutil.copy2)
+        logger.emit("copy_history", "completed", f"Copied local history for {root.label}", root=root, action="copy_local_history")
+
+    def _rebuild_active_root_from_phone(
+        self,
+        source_profile: Profile,
+        target_profile: Profile,
+        root: SyncRoot,
+        summary: SyncSummary,
+        logger: RunLogger,
+    ) -> list[FileState]:
+        previous_states = self.repository.list_file_states(source_profile.id, root.id)
+        device_files = self.transport.scan_root(source_profile.device_serial, root.device_path)
+        target_dir = local_root_path(target_profile, root)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        result_states: list[FileState] = []
+        for relative_path in sorted(set(previous_states) | set(device_files)):
+            summary.files_seen += 1
+            previous = previous_states.get(relative_path)
+            if relative_path in device_files:
+                state = self._pull_from_device(
+                    target_profile,
+                    root,
+                    relative_path,
+                    device_files[relative_path],
+                    False,
+                    summary,
+                    logger,
+                    previous,
+                )
+            else:
+                summary.removed += 1
+                logger.emit(
+                    "mirror_file",
+                    "completed",
+                    f"Marked {root.label}/{relative_path} removed in new mirror",
+                    root=root,
+                    relative_path=relative_path,
+                    action="remove_from_new_mirror",
+                )
+                state = FileState(
+                    id=previous.id if previous else None,
+                    profile_id=source_profile.id,
+                    root_id=root.id,
+                    relative_path=relative_path,
+                    status=REMOVED,
+                    device_present=False,
+                    device_hash=None,
+                    device_size=None,
+                    device_mtime=None,
+                    local_present=False,
+                    local_hash=None,
+                    local_size=None,
+                    local_mtime=None,
+                    conflict_copy_path=None,
+                    updated_at=utc_now(),
+                    last_synced_checkpoint_id=previous.last_synced_checkpoint_id if previous else None,
+                    last_restored_from_checkpoint_id=previous.last_restored_from_checkpoint_id if previous else None,
+                )
+            result_states.append(self._carry_forward_mirror_change_metadata(state, previous))
+        return result_states
+
+    def _restore_active_root_from_checkpoint(
+        self,
+        source_profile: Profile,
+        target_profile: Profile,
+        root: SyncRoot,
+        checkpoint_id: int,
+        summary: SyncSummary,
+        logger: RunLogger,
+    ) -> list[FileState]:
+        previous_states = self.repository.list_file_states(source_profile.id, root.id)
+        target_dir = local_root_path(target_profile, root)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        desired_entries = list(self.repository.list_checkpoint_entries(checkpoint_id, root.id))
+        desired_map = {row["relative_path"]: row for row in desired_entries}
+        root_states: dict[str, FileState] = {}
+
+        for relpath, row in desired_map.items():
+            blob_path = self.blob_store.path_for_hash(row["blob_hash"])
+            target = target_dir / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(blob_path, target)
+            previous = previous_states.get(relpath)
+            local_stat = FileMetadata(
+                relative_path=relpath,
+                size=target.stat().st_size,
+                mtime=int(target.stat().st_mtime),
+                absolute_path=str(target),
+            )
+            state = FileState(
+                id=previous.id if previous else None,
+                profile_id=source_profile.id,
+                root_id=root.id,
+                relative_path=relpath,
+                status=IN_SYNC,
+                device_present=True,
+                device_hash=row["blob_hash"],
+                device_size=row["size"],
+                device_mtime=row["device_mtime"],
+                local_present=True,
+                local_hash=row["blob_hash"],
+                local_size=local_stat.size,
+                local_mtime=local_stat.mtime,
+                conflict_copy_path=None,
+                updated_at=utc_now(),
+                last_synced_checkpoint_id=checkpoint_id,
+                last_restored_from_checkpoint_id=None,
+            )
+            root_states[relpath] = self._carry_forward_mirror_change_metadata(state, previous)
+            summary.files_seen += 1
+            logger.emit(
+                "mirror_file",
+                "completed",
+                f"Rebuilt {root.label}/{relpath} from checkpoint {checkpoint_id}",
+                root=root,
+                relative_path=relpath,
+                action="copy_checkpoint_blob",
+            )
+
+        for relpath in sorted(set(previous_states) - set(desired_map)):
+            previous = previous_states.get(relpath)
+            state = FileState(
+                id=previous.id if previous else None,
+                profile_id=source_profile.id,
+                root_id=root.id,
+                relative_path=relpath,
+                status=REMOVED,
+                device_present=False,
+                device_hash=None,
+                device_size=None,
+                device_mtime=None,
+                local_present=False,
+                local_hash=None,
+                local_size=None,
+                local_mtime=None,
+                conflict_copy_path=None,
+                updated_at=utc_now(),
+                last_synced_checkpoint_id=previous.last_synced_checkpoint_id if previous else checkpoint_id,
+                last_restored_from_checkpoint_id=previous.last_restored_from_checkpoint_id if previous else None,
+            )
+            root_states[relpath] = self._carry_forward_mirror_change_metadata(state, previous)
+            summary.removed += 1
+
+        return list(root_states.values())
+
+    @staticmethod
+    def _profile_with_mirror(profile: Profile, mirror_dir: Path) -> Profile:
+        return Profile(
+            id=profile.id,
+            name=profile.name,
+            device_serial=profile.device_serial,
+            mirror_dir=mirror_dir,
+            checkpoint_retention=profile.checkpoint_retention,
+            created_at=profile.created_at,
+            profile_state=profile.profile_state,
+            cloned_from_profile_id=profile.cloned_from_profile_id,
+            cloned_from_checkpoint_id=profile.cloned_from_checkpoint_id,
+        )
+
+    def _determine_change_mirror_source(self, profile: Profile, active_roots: list[SyncRoot]) -> tuple[str, int | None]:
+        if not active_roots:
+            return "local_history_only", None
+        try:
+            self.transport.probe_device(profile.device_serial)
+            return "phone", None
+        except Exception:
+            checkpoints = self.repository.list_checkpoints(profile.id)
+            if not checkpoints:
+                raise ValueError(
+                    f"Device {profile.device_serial} is unavailable and profile {profile.name} has no checkpoint fallback"
+                )
+            checkpoint_id = checkpoints[0].id
+            self._preflight_checkpoint_blobs(checkpoint_id, active_roots)
+            return "checkpoint", checkpoint_id
+
+    def _preflight_checkpoint_blobs(self, checkpoint_id: int, roots: list[SyncRoot]) -> None:
+        for root in roots:
+            for entry in self.repository.list_checkpoint_entries(checkpoint_id, root.id):
+                blob_path = self.blob_store.path_for_hash(entry["blob_hash"])
+                if not blob_path.exists():
+                    raise ValueError(f"Missing blob for checkpoint rebuild: {entry['blob_hash']}")
+
+    @staticmethod
+    def _validate_target_mirror_dir(current_mirror_dir: Path, target_mirror_dir: Path) -> None:
+        if target_mirror_dir == current_mirror_dir:
+            raise ValueError("Backup folder is already set to that path")
+        if target_mirror_dir.exists():
+            if not target_mirror_dir.is_dir():
+                raise ValueError(f"Target backup folder must be a directory: {target_mirror_dir}")
+            if any(target_mirror_dir.iterdir()):
+                raise ValueError(f"Target backup folder must be empty: {target_mirror_dir}")
+            return
+
+        parent = target_mirror_dir.parent
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        if not parent.exists() or not parent.is_dir():
+            raise ValueError(f"Target backup folder has no valid parent directory: {target_mirror_dir}")
+        if not os.access(parent, os.W_OK):
+            raise ValueError(f"Parent directory is not writable: {parent}")
+
+    @staticmethod
+    def _carry_forward_mirror_change_metadata(state: FileState, previous: FileState | None) -> FileState:
+        if previous is None:
+            return state
+        state.last_synced_checkpoint_id = previous.last_synced_checkpoint_id
+        state.last_restored_from_checkpoint_id = previous.last_restored_from_checkpoint_id
+        if previous.status == CONFLICT and state.device_present and state.local_present:
+            state.status = CONFLICT
+            state.conflict_copy_path = previous.conflict_copy_path
+        return state
+
+    @staticmethod
+    def _cleanup_target_mirror_dir(target_mirror_dir: Path, *, existed_before: bool) -> None:
+        if not target_mirror_dir.exists():
+            return
+        if existed_before:
+            for child in list(target_mirror_dir.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except FileNotFoundError:
+                        pass
+            return
+        shutil.rmtree(target_mirror_dir, ignore_errors=True)
 
     def _sync_root(
         self,
