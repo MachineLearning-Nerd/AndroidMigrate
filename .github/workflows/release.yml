@@ -124,6 +124,26 @@ jobs:
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('${PKG_SHA256}')/" PKGBUILD
 
+          # Regenerate .SRCINFO from updated PKGBUILD (tab-indented sub-entries)
+          {
+            printf '%s\n' "pkgbase = androidmigrate"
+            printf '\t%s\n' \
+              "pkgdesc = Checkpointed Android folder backup and sync over ADB" \
+              "pkgver = ${PKG_VERSION}" \
+              "pkgrel = 1" \
+              "url = https://github.com/MachineLearning-Nerd/AndroidMigrate" \
+              "arch = any" \
+              "license = MIT" \
+              "makedepends = python-build" \
+              "makedepends = python-installer" \
+              "makedepends = python-setuptools" \
+              "depends = python>=3.12" \
+              "depends = android-tools" \
+              "source = androidmigrate-${PKG_VERSION}.tar.gz::https://github.com/MachineLearning-Nerd/AndroidMigrate/archive/refs/tags/v${PKG_VERSION}.tar.gz" \
+              "sha256sums = ${PKG_SHA256}"
+            printf '\n%s\n' "pkgname = androidmigrate"
+          } > .SRCINFO
+
           git config user.email "ci@androidmigrate"
           git config user.name "CI"
           git add PKGBUILD .SRCINFO
