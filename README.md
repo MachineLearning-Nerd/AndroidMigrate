@@ -24,7 +24,30 @@ AndroidMigrate keeps a local mirror of folders on your Android device, tracks ch
 
 ## Installation
 
+### PyPI (all platforms)
+
 ```bash
+pip install androidmigrate
+```
+
+### AUR (Arch Linux)
+
+```bash
+yay -S androidmigrate
+```
+
+### Homebrew (macOS)
+
+```bash
+brew tap MachineLearning-Nerd/tap
+brew install androidmigrate
+```
+
+### From source
+
+```bash
+git clone https://github.com/MachineLearning-Nerd/AndroidMigrate.git
+cd AndroidMigrate
 pip install -e .
 ```
 

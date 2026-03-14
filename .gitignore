@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .mypy_cache/
 .androidmigrate/
+dist/
+build/
+*.egg-info/

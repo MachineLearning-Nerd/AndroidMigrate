@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and test deps
+        run: |
+          pip install -e .
+          pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  pypi:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release create "$TAG_NAME" dist/* --generate-notes
+
+  aur:
+    needs: [pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "VERSION=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release tarball and compute sha256
+        id: sha
+        env:
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          URL="https://github.com/${REPO}/archive/refs/tags/${REF_NAME}.tar.gz"
+          curl -sL "$URL" -o release.tar.gz
+          SHA=$(sha256sum release.tar.gz | cut -d' ' -f1)
+          echo "SHA256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Setup SSH for AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+
+      - name: Clone AUR repo and update PKGBUILD
+        env:
+          PKG_VERSION: ${{ steps.version.outputs.VERSION }}
+          PKG_SHA256: ${{ steps.sha.outputs.SHA256 }}
+        run: |
+          git clone ssh://aur@aur.archlinux.org/androidmigrate.git aur-repo
+          cd aur-repo
+
+          sed -i "s/^pkgver=.*/pkgver=${PKG_VERSION}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${PKG_SHA256}')/" PKGBUILD
+
+          git config user.email "ci@androidmigrate"
+          git config user.name "CI"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || git commit -m "Update to ${PKG_VERSION}"
+          git push
+
+  homebrew:
+    needs: [pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "VERSION=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release tarball and compute sha256
+        id: sha
+        env:
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          URL="https://github.com/${REPO}/archive/refs/tags/${REF_NAME}.tar.gz"
+          curl -sL "$URL" -o release.tar.gz
+          SHA=$(sha256sum release.tar.gz | cut -d' ' -f1)
+          echo "SHA256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PKG_VERSION: ${{ steps.version.outputs.VERSION }}
+          PKG_SHA256: ${{ steps.sha.outputs.SHA256 }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/MachineLearning-Nerd/homebrew-tap.git" tap
+          cd tap
+
+          mkdir -p Formula
+          cat > Formula/androidmigrate.rb <<FORMULA
+          class Androidmigrate < Formula
+            include Language::Python::Virtualenv
+
+            desc "Checkpointed Android folder backup and sync over ADB"
+            homepage "https://github.com/MachineLearning-Nerd/AndroidMigrate"
+            url "https://github.com/MachineLearning-Nerd/AndroidMigrate/archive/refs/tags/v${PKG_VERSION}.tar.gz"
+            sha256 "${PKG_SHA256}"
+            license "MIT"
+
+            depends_on "python@3.12"
+
+            def install
+              virtualenv_install_with_resources
+            end
+
+            def caveats
+              <<~EOS
+                androidmigrate requires adb (Android Debug Bridge) to communicate with devices.
+                Install it via:
+                  brew install --cask android-platform-tools
+              EOS
+            end
+
+            test do
+              assert_match "usage:", shell_output("#{bin}/androidmigrate --help", 0)
+            end
+          end
+          FORMULA
+
+          git config user.email "ci@androidmigrate"
+          git config user.name "CI"
+          git add Formula/androidmigrate.rb
+          git diff --cached --quiet || git commit -m "Update androidmigrate to ${PKG_VERSION}"
+          git push

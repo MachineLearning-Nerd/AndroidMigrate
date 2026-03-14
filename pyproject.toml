@@ -4,17 +4,43 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "androidmigrate"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Checkpointed Android folder backup and sync over adb."
-readme = "PLAN.md"
+readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "Codex" }]
+license = "MIT"
+authors = [{ name = "Dinesh Jinjala" }]
+keywords = ["android", "backup", "adb", "sync", "migrate"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Utilities",
+]
 
 [project.scripts]
 androidmigrate = "androidmigrate.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/MachineLearning-Nerd/AndroidMigrate"
+Repository = "https://github.com/MachineLearning-Nerd/AndroidMigrate"
+Issues = "https://github.com/MachineLearning-Nerd/AndroidMigrate/issues"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+[tool.setuptools.dynamic]
+version = { attr = "androidmigrate.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
