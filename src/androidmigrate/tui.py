@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import curses
+import os
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +51,20 @@ class MirrorPathState:
     status_message: str = "Type the exact new backup folder path"
     suggestions: list[str] = field(default_factory=list)
     suggestion_index: int = 0
+
+
+@dataclass(slots=True)
+class CreateProfileState:
+    active_field: int = 0
+    name_text: str = ""
+    device_index: int = 0
+    devices: list = field(default_factory=list)
+    mirror_text: str = ""
+    retention_text: str = "30"
+    suggestions: list[str] = field(default_factory=list)
+    suggestion_index: int = 0
+    status_message: str = "Enter a profile name"
+    existing_names: set = field(default_factory=set)
 
 
 def _visible_bounds(selected: int, total: int, max_rows: int) -> tuple[int, int]:
@@ -432,6 +448,395 @@ class MirrorPathScreen:
         safe_addstr(self.stdscr, height - 1, 2, truncate_right(text, width - 4), self.theme.footer)
 
 
+class CreateProfileScreen:
+    FIELD_NAME = 0
+    FIELD_DEVICE = 1
+    FIELD_MIRROR = 2
+    FIELD_RETENTION = 3
+    FIELD_LABELS = ("Name", "Device", "Mirror", "Retention")
+
+    def __init__(self, stdscr, repository, transport, theme) -> None:
+        self.stdscr = stdscr
+        self.repository = repository
+        self.transport = transport
+        self.theme = theme
+        self.state = CreateProfileState()
+        self.state.existing_names = {p.name for p in repository.list_profiles()}
+        self._refresh_devices()
+
+    def _refresh_devices(self) -> None:
+        try:
+            all_devices = self.transport.list_devices()
+        except Exception:
+            all_devices = []
+        self.state.devices = [d for d in all_devices if d.state == "device"]
+        if self.state.devices:
+            self.state.device_index = min(self.state.device_index, len(self.state.devices) - 1)
+        else:
+            self.state.device_index = 0
+
+    def run(self) -> str | None:
+        while True:
+            self.draw()
+            ch = self.stdscr.getch()
+            if ch in (27,):
+                if self.state.suggestions:
+                    self.state.suggestions.clear()
+                    self.state.status_message = "Dismissed suggestions"
+                    continue
+                return None
+            if ch == ord("q") and self.state.active_field != self.FIELD_NAME and self.state.active_field != self.FIELD_MIRROR:
+                if self.state.suggestions:
+                    self.state.suggestions.clear()
+                    self.state.status_message = "Dismissed suggestions"
+                    continue
+                return None
+
+            if ch == 9:  # Tab
+                if self.state.active_field == self.FIELD_MIRROR:
+                    if self.state.mirror_text:
+                        result = autocomplete_directory_input(self.state.mirror_text)
+                        self.state.mirror_text = result.updated_text
+                        self.state.suggestions = result.suggestions
+                        self.state.suggestion_index = 0
+                        self.state.status_message = result.message
+                    else:
+                        self.state.status_message = "Enter a path before autocompleting"
+                    continue
+                self._advance_field(1)
+                continue
+            if ch == curses.KEY_BTAB:  # Shift-Tab
+                self._advance_field(-1)
+                continue
+
+            if ch in (curses.KEY_UP, ord("k")):
+                if self.state.active_field == self.FIELD_DEVICE and self.state.devices:
+                    self.state.device_index = max(0, self.state.device_index - 1)
+                elif self.state.suggestions:
+                    self.state.suggestion_index = max(0, self.state.suggestion_index - 1)
+                continue
+            if ch in (curses.KEY_DOWN, ord("j")):
+                if self.state.active_field == self.FIELD_DEVICE and self.state.devices:
+                    self.state.device_index = min(len(self.state.devices) - 1, self.state.device_index + 1)
+                elif self.state.suggestions:
+                    self.state.suggestion_index = min(len(self.state.suggestions) - 1, self.state.suggestion_index + 1)
+                continue
+
+            if ch == ord("r") and self.state.active_field == self.FIELD_DEVICE:
+                self._refresh_devices()
+                self.state.status_message = "Refreshed device list"
+                continue
+
+            if ch in (curses.KEY_ENTER, 10, 13):
+                if self.state.suggestions:
+                    self.state.mirror_text = self.state.suggestions[self.state.suggestion_index]
+                    self.state.suggestions.clear()
+                    self._update_status()
+                    continue
+                if self.state.active_field == self.FIELD_RETENTION:
+                    result = self._submit()
+                    if result is not None:
+                        return result
+                    continue
+                self._advance_field(1)
+                continue
+
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if self.state.active_field == self.FIELD_NAME:
+                    self.state.name_text = self.state.name_text[:-1]
+                elif self.state.active_field == self.FIELD_MIRROR:
+                    self.state.mirror_text = self.state.mirror_text[:-1]
+                    self.state.suggestions.clear()
+                elif self.state.active_field == self.FIELD_RETENTION:
+                    self.state.retention_text = self.state.retention_text[:-1]
+                self._update_status()
+                continue
+            if ch == 21:  # Ctrl+U
+                if self.state.active_field == self.FIELD_NAME:
+                    self.state.name_text = ""
+                elif self.state.active_field == self.FIELD_MIRROR:
+                    self.state.mirror_text = ""
+                    self.state.suggestions.clear()
+                elif self.state.active_field == self.FIELD_RETENTION:
+                    self.state.retention_text = ""
+                self._update_status()
+                continue
+
+            if 32 <= ch <= 126:
+                char = chr(ch)
+                if self.state.active_field == self.FIELD_NAME:
+                    self.state.name_text += char
+                elif self.state.active_field == self.FIELD_MIRROR:
+                    self.state.mirror_text += char
+                    self.state.suggestions.clear()
+                elif self.state.active_field == self.FIELD_RETENTION:
+                    if char.isdigit():
+                        self.state.retention_text += char
+                self._update_status()
+
+    def _advance_field(self, direction: int) -> None:
+        self.state.suggestions.clear()
+        self.state.active_field = max(0, min(3, self.state.active_field + direction))
+        self._update_status()
+
+    def _update_status(self) -> None:
+        field = self.state.active_field
+        if field == self.FIELD_NAME:
+            name = self.state.name_text.strip()
+            if not name:
+                self.state.status_message = "Enter a profile name"
+            elif name in self.state.existing_names:
+                self.state.status_message = f"Name already exists: {name}"
+            else:
+                self.state.status_message = f"Name: {name}"
+        elif field == self.FIELD_DEVICE:
+            if not self.state.devices:
+                self.state.status_message = "No devices available -- press r to refresh"
+            else:
+                d = self.state.devices[self.state.device_index]
+                model = f" ({d.model})" if d.model else ""
+                self.state.status_message = f"Device: {d.serial}{model}"
+        elif field == self.FIELD_MIRROR:
+            self.state.status_message = self._validate_mirror_message()
+        elif field == self.FIELD_RETENTION:
+            text = self.state.retention_text.strip()
+            if not text:
+                self.state.status_message = "Enter retention days (positive integer)"
+            elif not text.isdigit() or int(text) <= 0:
+                self.state.status_message = "Retention must be a positive integer"
+            else:
+                self.state.status_message = f"Retention: {text} days"
+
+    def _validate_mirror_message(self) -> str:
+        candidate = self.state.mirror_text.strip()
+        if not candidate:
+            return "Enter a backup folder path"
+        target = Path(candidate).expanduser().resolve()
+        if target.exists():
+            if not target.is_dir():
+                return f"Not a directory: {target}"
+            if not os.access(target, os.W_OK):
+                return f"Directory is not writable: {target}"
+            return f"Ready: {target}"
+        parent = target.parent
+        while not parent.exists():
+            if parent == parent.parent:
+                return f"No valid parent directory: {target}"
+            parent = parent.parent
+        if not parent.is_dir():
+            return f"Parent is not a directory: {parent}"
+        if not os.access(parent, os.W_OK):
+            return f"Parent directory is not writable: {parent}"
+        return f"Ready to create: {target}"
+
+    def _validate_all(self) -> str | None:
+        name = self.state.name_text.strip()
+        if not name:
+            self.state.active_field = self.FIELD_NAME
+            return "Name cannot be empty"
+        if name in self.state.existing_names:
+            self.state.active_field = self.FIELD_NAME
+            return f"Name already exists: {name}"
+        if not self.state.devices:
+            self.state.active_field = self.FIELD_DEVICE
+            return "No devices available"
+        mirror = self.state.mirror_text.strip()
+        if not mirror:
+            self.state.active_field = self.FIELD_MIRROR
+            return "Mirror path cannot be empty"
+        target = Path(mirror).expanduser().resolve()
+        if target.exists() and not target.is_dir():
+            self.state.active_field = self.FIELD_MIRROR
+            return f"Not a directory: {target}"
+        if not target.exists():
+            parent = target.parent
+            while not parent.exists():
+                if parent == parent.parent:
+                    self.state.active_field = self.FIELD_MIRROR
+                    return f"No valid parent directory: {target}"
+                parent = parent.parent
+            if not parent.is_dir() or not os.access(parent, os.W_OK):
+                self.state.active_field = self.FIELD_MIRROR
+                return f"Parent not writable: {parent}"
+        elif not os.access(target, os.W_OK):
+            self.state.active_field = self.FIELD_MIRROR
+            return f"Directory is not writable: {target}"
+        retention = self.state.retention_text.strip()
+        if not retention or not retention.isdigit() or int(retention) <= 0:
+            self.state.active_field = self.FIELD_RETENTION
+            return "Retention must be a positive integer"
+        return None
+
+    def _submit(self) -> str | None:
+        error = self._validate_all()
+        if error:
+            self.state.status_message = error
+            return None
+
+        name = self.state.name_text.strip()
+        device = self.state.devices[self.state.device_index]
+        mirror_dir = Path(self.state.mirror_text.strip()).expanduser().resolve() / name
+        retention = int(self.state.retention_text.strip())
+
+        model_label = f" ({device.model})" if device.model else ""
+        lines = [
+            f"Name:      {name}",
+            f"Device:    {device.serial}{model_label}",
+            f"Mirror:    {mirror_dir}",
+            f"Retention: {retention} days",
+            "",
+            "Press Enter to confirm or q/Esc to cancel.",
+        ]
+        if not self._show_confirmation("Confirm New Profile", lines):
+            self.state.status_message = "Profile creation not confirmed"
+            return None
+
+        try:
+            profile = self.repository.create_profile(
+                name=name,
+                device_serial=device.serial,
+                mirror_dir=mirror_dir,
+                checkpoint_retention=retention,
+            )
+        except sqlite3.IntegrityError:
+            self.state.active_field = self.FIELD_NAME
+            self.state.existing_names.add(name)
+            self.state.status_message = f"Name already taken: {name}"
+            return None
+
+        try:
+            mirror_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.repository.delete_profile(profile.id)
+            self.state.active_field = self.FIELD_MIRROR
+            self.state.status_message = f"Unable to create mirror directory: {exc}"
+            return None
+
+        return f"Saved new profile {name}"
+
+    def _show_confirmation(self, title: str, lines: list[str]) -> bool:
+        height, width = self.stdscr.getmaxyx()
+        box_height = min(max(len(lines) + 4, 8), height - 4)
+        box_width = min(max(max(len(line) for line in lines) + 4, 56), width - 4)
+        top = max(0, (height - box_height) // 2)
+        left = max(0, (width - box_width) // 2)
+
+        while True:
+            draw_panel(self.stdscr, self.theme, top, left, box_height, box_width, title, focused=True)
+            for row, line in enumerate(lines[: max(0, box_height - 2)]):
+                safe_addstr(self.stdscr, top + 1 + row, left + 1, truncate_right(line, box_width - 2), self.theme.text)
+            self.stdscr.refresh()
+            ch = self.stdscr.getch()
+            if ch in (curses.KEY_ENTER, 10, 13):
+                return True
+            if ch in (ord("q"), 27):
+                return False
+
+    def draw(self) -> None:
+        self.stdscr.erase()
+        height, width = self.stdscr.getmaxyx()
+        if height < MIN_HEIGHT or width < MIN_WIDTH:
+            _draw_resize_overlay(self.stdscr, height, width, f"Resize terminal to at least {MIN_WIDTH}x{MIN_HEIGHT}")
+            return
+
+        self._draw_header("Create Profile", "")
+        self._draw_banner(Banner(self.state.status_message, infer_message_tone(self.state.status_message)))
+
+        panel_height = 8
+        panel_y, panel_x, panel_h, panel_w = draw_panel(
+            self.stdscr, self.theme, 3, 1, panel_height, width - 2, "Profile Details", focused=True,
+        )
+
+        fields = [
+            ("Name", self.state.name_text),
+            ("Device", self._device_label()),
+            ("Mirror", self.state.mirror_text),
+            ("Retention", self.state.retention_text),
+        ]
+        for i, (label, value) in enumerate(fields):
+            y = panel_y + i
+            is_active = i == self.state.active_field
+            indicator = ">" if is_active else " "
+            label_text = f"{indicator} {label}:"
+            safe_addstr(self.stdscr, y, panel_x + 1, label_text, self.theme.title if is_active else self.theme.muted)
+            value_x = panel_x + 14
+            value_w = max(0, panel_w - 15)
+            if i == self.FIELD_DEVICE:
+                display = truncate_right(value or "(none)", value_w)
+                safe_addstr(self.stdscr, y, value_x, display, self.theme.text)
+            else:
+                display_value = value if value else ""
+                cursor_char = "_" if is_active else ""
+                display = truncate_right(display_value + cursor_char, value_w)
+                safe_addstr(self.stdscr, y, value_x, display, self.theme.text)
+
+        # Device list or mirror suggestions below the form panel
+        list_top = 3 + panel_height
+        list_height = max(4, height - list_top - 3)
+        if self.state.active_field == self.FIELD_DEVICE and self.state.devices:
+            list_y, list_x, list_h, list_w = draw_panel(
+                self.stdscr, self.theme, list_top, 1, list_height, width - 2, "Available Devices",
+                note=format_scroll_label(0, min(len(self.state.devices), list_height - 2), len(self.state.devices)),
+            )
+            visible_start, visible_end = _visible_bounds(self.state.device_index, len(self.state.devices), list_h)
+            for row, device in enumerate(self.state.devices[visible_start:visible_end]):
+                actual_index = visible_start + row
+                y = list_y + row
+                row_attr = self.theme.selected if actual_index == self.state.device_index else self.theme.text
+                fill_line(self.stdscr, y, list_x, list_w, row_attr if row_attr == self.theme.selected else self.theme.text)
+                model = f" ({device.model})" if device.model else ""
+                safe_addstr(self.stdscr, y, list_x + 1, truncate_right(f"{device.serial}{model}", list_w - 2), row_attr)
+        elif self.state.active_field == self.FIELD_MIRROR:
+            list_y, list_x, list_h, list_w = draw_panel(
+                self.stdscr, self.theme, list_top, 1, list_height, width - 2, "Directory Suggestions",
+                note=format_scroll_label(0, min(len(self.state.suggestions), max(1, list_height - 2)), len(self.state.suggestions)),
+            )
+            if not self.state.suggestions:
+                draw_centered_placeholder(self.stdscr, list_y, list_x, list_h, list_w, "Press Tab for directory autocomplete", self.theme.muted)
+            for row, suggestion in enumerate(self.state.suggestions[:list_h]):
+                row_attr = self.theme.selected if row == self.state.suggestion_index else self.theme.text
+                fill_line(self.stdscr, list_y + row, list_x, list_w, row_attr if row_attr == self.theme.selected else self.theme.text)
+                safe_addstr(self.stdscr, list_y + row, list_x + 1, truncate_right(suggestion, list_w - 2), row_attr)
+
+        # Footer
+        footer_keys = self._footer_text()
+        status_attr = tone_attr(self.theme, infer_message_tone(self.state.status_message))
+        fill_line(self.stdscr, height - 2, 0, width, status_attr)
+        safe_addstr(self.stdscr, height - 2, 2, truncate_right(self.state.status_message, width - 4), status_attr)
+        fill_line(self.stdscr, height - 1, 0, width, self.theme.footer)
+        safe_addstr(self.stdscr, height - 1, 2, truncate_right(footer_keys, width - 4), self.theme.footer)
+        self.stdscr.refresh()
+
+    def _device_label(self) -> str:
+        if not self.state.devices:
+            return "(no devices)"
+        d = self.state.devices[self.state.device_index]
+        model = f" ({d.model})" if d.model else ""
+        return f"{d.serial}{model}"
+
+    def _footer_text(self) -> str:
+        field = self.state.active_field
+        if field == self.FIELD_DEVICE:
+            return "Up/Down select device  r refresh  Tab next  Shift-Tab prev  Esc cancel"
+        if field == self.FIELD_MIRROR:
+            return "Type path  Tab autocomplete  Up/Down suggestions  Enter confirm  Ctrl+U clear  Shift-Tab prev  Esc cancel"
+        if field == self.FIELD_RETENTION:
+            return "Type digits  Enter submit  Ctrl+U clear  Shift-Tab prev  Esc cancel"
+        return "Type name  Tab next  Ctrl+U clear  Esc cancel"
+
+    def _draw_header(self, title: str, subtitle: str) -> None:
+        width = self.stdscr.getmaxyx()[1]
+        fill_line(self.stdscr, 0, 0, width, self.theme.header)
+        safe_addstr(self.stdscr, 0, 2, truncate_right(title, width // 2), self.theme.title)
+        if subtitle:
+            safe_addstr(self.stdscr, 0, max(2, width - len(subtitle) - 2), truncate_left(subtitle, width // 2), self.theme.muted)
+
+    def _draw_banner(self, banner: Banner) -> None:
+        width = self.stdscr.getmaxyx()[1]
+        fill_line(self.stdscr, 1, 0, width, tone_attr(self.theme, banner.tone))
+        safe_addstr(self.stdscr, 1, 2, truncate_right(banner.text, width - 4), tone_attr(self.theme, banner.tone))
+
+
 class DashboardApp:
     def __init__(self, stdscr, repository: Repository, blob_store: BlobStore, transport: ADBTransport) -> None:
         self.stdscr = stdscr
@@ -480,6 +885,7 @@ class DashboardApp:
                     [
                         "Dashboard",
                         "  j/k or arrows   move between profiles",
+                        "  n               create new profile",
                         "  e               edit roots for selected profile",
                         "  m               change backup folder",
                         "  y               sync selected profile",
@@ -514,6 +920,9 @@ class DashboardApp:
                 continue
             if ch == ord("y"):
                 self.run_sync()
+                continue
+            if ch == ord("n"):
+                self.create_profile()
                 continue
 
     def selected_profile(self):
@@ -591,7 +1000,7 @@ class DashboardApp:
         )
 
         if not self.profiles:
-            draw_centered_placeholder(self.stdscr, profiles_y, profiles_x, profiles_h, profiles_w, "No profiles configured", self.theme.warning)
+            draw_centered_placeholder(self.stdscr, profiles_y, profiles_x, profiles_h, profiles_w, "No profiles configured -- press n to create one", self.theme.warning)
         for row, profile in enumerate(self.profiles[profile_start:profile_end]):
             actual_index = profile_start + row
             y = profiles_y + row
@@ -706,7 +1115,7 @@ class DashboardApp:
             self.stdscr,
             height - 1,
             2,
-            truncate_right("j/k move  e edit roots  m backup folder  y sync  c checkpoints  i issues  l runs  r refresh  ? help  q quit", width - 4),
+            truncate_right("j/k move  n new  e edit roots  m backup folder  y sync  c checkpoints  i issues  l runs  r refresh  ? help  q quit", width - 4),
             self.theme.footer,
         )
 
@@ -730,6 +1139,12 @@ class DashboardApp:
         status = RootManagerScreen(self.stdscr, controller, self.theme).run()
         self.refresh()
         self.state.status_message = status
+
+    def create_profile(self) -> None:
+        status = CreateProfileScreen(self.stdscr, self.repository, self.transport, self.theme).run()
+        self.refresh()
+        if status:
+            self.state.status_message = status
 
     def open_mirror_change(self) -> None:
         profile = self.selected_profile()

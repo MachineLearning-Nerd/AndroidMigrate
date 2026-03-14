@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.checkpoint_id,
                 target_device_serial=args.target_device,
                 target_profile_name=args.new_profile,
-                target_mirror_dir=Path(args.mirror_dir),
+                target_mirror_dir=Path(args.mirror_dir).expanduser().resolve() / args.new_profile,
             )
             print(summary_to_text(summary))
             return 0
@@ -152,7 +152,7 @@ def _cmd_devices(transport: ADBTransport) -> int:
 
 def _cmd_profile(repository: Repository, args: argparse.Namespace) -> int:
     if args.profile_command == "create":
-        mirror_dir = Path(args.mirror_dir).expanduser().resolve()
+        mirror_dir = Path(args.mirror_dir).expanduser().resolve() / args.name
         profile = repository.create_profile(
             name=args.name,
             device_serial=args.device_serial,
